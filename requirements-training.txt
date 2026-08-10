@@ -1,0 +1,5 @@
+-r requirements-analysis.txt
+norse>=1.1
+scipy>=1.11
+# Install a PyTorch build appropriate for the host CUDA/CPU platform.
+torch>=2.1

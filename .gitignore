@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+*.pkl
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+multiseed/results/seed*/
+multiseed/results/**/checkpoints/
+build/
+dist/
