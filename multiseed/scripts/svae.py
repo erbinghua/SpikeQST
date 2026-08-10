@@ -1,0 +1,2044 @@
+#!/usr/bin/env python3
+"""AUTO-GENERATED from SVAE_GHZ_Mixed_V1.ipynb.
+
+Manual patches applied: see CONVERSION_CHECKLIST.md.
+"""
+import os, sys, argparse
+from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import matplotlib
+matplotlib.use("Agg")  # headless: no interactive plotting on VM
+
+# Make seed_utils importable regardless of where the script is launched from
+_THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_THIS_DIR.parent.parent))  # multiseed/
+from seed_utils import set_global_seed  # noqa: E402
+
+
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--seed", type=int, required=True,
+                   help="Random seed for this run (training stochasticity).")
+    p.add_argument("--out_dir", required=True,
+                   help="Output dir; CSVs and checkpoints land here.")
+    p.add_argument("--quick", action="store_true",
+                   help="Smoke test: smallest config, few steps.")
+    p.add_argument("--device", default=None,
+                   help="Override torch device (e.g. cpu/cuda).")
+    return p.parse_args()
+
+
+_ARGS = _parse_args()
+SEED = _ARGS.seed
+OUT_DIR = Path(_ARGS.out_dir)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+set_global_seed(SEED)
+# === MULTISEED BENCHMARK PATCHED ===
+
+
+# ─── MULTISEED HELPERS ────────────────────────────────────────────────────
+def _seed_done(method_label):
+    """Has this seed × method combo already produced rows in CSV_PATH?"""
+    if not CSV_PATH.exists():
+        return False
+    try:
+        df = pd.read_csv(CSV_PATH)
+    except Exception:
+        return False
+    if df.empty or 'seed' not in df.columns or 'method' not in df.columns:
+        return False
+    return ((df['seed'] == SEED) & (df['method'] == method_label)).any()
+
+
+def _save_with_seed(results_dict, method_label, flatten_fn):
+    """Flatten the nested results dict to a DataFrame, add seed/method, append to CSV.
+
+    Tries to pass method_label to flatten_fn if the function accepts it
+    (e.g. create_results_table(results, method_name='M1')).
+    """
+    import inspect
+    sig = inspect.signature(flatten_fn)
+    try:
+        if 'method_name' in sig.parameters:
+            df_new = flatten_fn(results_dict, method_name=method_label)
+        else:
+            df_new = flatten_fn(results_dict)
+    except Exception as e:
+        print(f"[multiseed] flatten_fn failed: {e}; falling back to manual flatten",
+              flush=True)
+        df_new = pd.DataFrame()
+    if df_new is None or len(df_new) == 0:
+        # Final fallback: manually flatten any nested dict-of-lists-of-dicts
+        rows = []
+        def _walk(o):
+            if isinstance(o, dict):
+                for v in o.values():
+                    _walk(v)
+            elif isinstance(o, list):
+                for r in o:
+                    if isinstance(r, dict):
+                        rows.append(r)
+                    else:
+                        _walk(r)
+        _walk(results_dict)
+        df_new = pd.DataFrame(rows) if rows else pd.DataFrame()
+    df_new['seed'] = SEED
+    df_new['method'] = method_label
+    if CSV_PATH.exists():
+        df_old = pd.read_csv(CSV_PATH)
+        df_combined = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+    df_combined.to_csv(CSV_PATH, index=False)
+    print(f"[multiseed] saved {len(df_new)} rows for seed={SEED} method={method_label} → {CSV_PATH}",
+          flush=True)
+# ──────────────────────────────────────────────────────────────────────────
+print(f"[multiseed] seed={SEED}  out_dir={OUT_DIR}", flush=True)
+
+
+# === cell #0 ===
+# =============================================================================
+# 1. SETUP & IMPORTS
+# =============================================================================
+import os, math, random, time, numpy as np
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
+import matplotlib.pyplot as plt
+import pandas as pd
+from collections import defaultdict
+import pickle
+from pathlib import Path
+import norse.torch as norse
+
+plt.rcParams['figure.figsize'] = (10, 6)
+plt.rcParams['font.size'] = 12
+
+# GPU Setup
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# GPU Optimizations
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+# Checkpoint directory
+# (multiseed: redirected to per-seed OUT_DIR)
+CHECKPOINT_DIR = OUT_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+CSV_PATH = OUT_DIR / "results.csv"
+print("="*70)
+print("🚀 QUANTUM STATE TOMOGRAPHY: VAE vs SVAE ENERGY BENCHMARK - MIXED GHZ")
+print("="*70)
+print(f"✓ PyTorch {torch.__version__}")
+print(f"✓ Device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"✓ GPU: {torch.cuda.get_device_name(0)}")
+    print(f"✓ GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+print(f"✓ Norse: Installed")
+
+
+# === cell #1 ===
+# =============================================================================
+# 2. HARDWARE ENERGY PARAMETERS
+# =============================================================================
+
+"""
+Riferimenti:
+- GPU: Horowitz ISSCC 2014 (scalato a 7nm), NVIDIA A100 whitepaper
+- Loihi: Davies+ IEEE Micro 2018 "Loihi: A Neuromorphic Manycore Processor"
+- Memristor: Cai+ Nature Electronics 2019, Yao+ Nature 2020
+"""
+
+# GPU (NVIDIA A100, 7nm)
+GPU_PARAMS = {
+    'name': 'NVIDIA A100 (7nm)',
+    'E_MAC': 35e-12,              # 35 pJ/MAC (FP16/FP32 fused)
+    'E_DRAM': 640e-12,            # 640 pJ/DRAM access
+    'E_L2_cache': 5e-12,          # 5 pJ/L2 access
+    'cache_hit_rate': 0.85,       # 85% cache hit rate
+    'TDP_W': 400,                 # 400W TDP
+    'util_small_model': 0.05,     # 5% utilization for small models
+}
+
+# Intel Loihi (14nm)
+LOIHI_PARAMS = {
+    'name': 'Intel Loihi (14nm)',
+    'E_spike': 23.6e-12,          # 23.6 pJ/spike (axon + synapse + dendrite)
+    'E_synapse': 81e-15,          # 81 fJ/synaptic operation
+    'E_neuron_leak': 0.5e-12,     # 0.5 pJ/neuron/timestep leakage
+    'E_router': 10e-12,           # 10 pJ/spike routing
+}
+
+# Memristor Crossbar (65nm CMOS + RRAM)
+MEMRISTOR_PARAMS = {
+    'name': 'Memristor Crossbar (65nm)',
+    'E_MAC_analog': 2e-15,        # 2 fJ/MAC (resistive MVM)
+    'E_ADC_8bit': 20e-12,         # 20 pJ/conversion (8-bit SAR)
+    'E_ADC_4bit': 5e-12,          # 5 pJ/conversion (4-bit)
+    'E_DAC_8bit': 10e-12,         # 10 pJ/conversion (8-bit)
+    'E_DAC_4bit': 2.5e-12,        # 2.5 pJ/conversion (4-bit)
+    'E_spike_gen': 3e-12,         # 3 pJ/spike (LIF analog circuit)
+    'E_write': 100e-12,           # 100 pJ/weight write (RRAM program)
+    'E_leakage': 0.1e-12,         # 0.1 pJ/neuron/timestep
+}
+
+print("="*70)
+print("📊 HARDWARE ENERGY PARAMETERS")
+print("="*70)
+
+print(f"\n🖥️  GPU ({GPU_PARAMS['name']}):")
+print(f"   E_MAC = {GPU_PARAMS['E_MAC']*1e12:.0f} pJ")
+print(f"   E_DRAM = {GPU_PARAMS['E_DRAM']*1e12:.0f} pJ")
+print(f"   E_L2 = {GPU_PARAMS['E_L2_cache']*1e12:.0f} pJ")
+
+print(f"\n🧠 Loihi ({LOIHI_PARAMS['name']}):")
+print(f"   E_spike = {LOIHI_PARAMS['E_spike']*1e12:.1f} pJ")
+print(f"   E_synapse = {LOIHI_PARAMS['E_synapse']*1e15:.0f} fJ")
+print(f"   E_leak = {LOIHI_PARAMS['E_neuron_leak']*1e12:.1f} pJ/neuron/ts")
+
+print(f"\n⚡ Crossbar ({MEMRISTOR_PARAMS['name']}):")
+print(f"   E_MAC_analog = {MEMRISTOR_PARAMS['E_MAC_analog']*1e15:.0f} fJ")
+print(f"   E_ADC_8bit = {MEMRISTOR_PARAMS['E_ADC_8bit']*1e12:.0f} pJ")
+print(f"   E_ADC_4bit = {MEMRISTOR_PARAMS['E_ADC_4bit']*1e12:.0f} pJ")
+print(f"   E_DAC_8bit = {MEMRISTOR_PARAMS['E_DAC_8bit']*1e12:.0f} pJ")
+
+
+# === cell #2 ===
+# =============================================================================
+# ENERGY ESTIMATION FUNCTIONS (CORRECTED: per-layer MAC counting)
+# =============================================================================
+
+def _is_linear_like(m):
+    """Return True for nn.Linear OR any custom layer that exposes
+    in_features/out_features/weight (e.g. QuantizedLinear).
+    Needed because the crossbar models use QuantizedLinear which does not
+    inherit from nn.Linear, so plain isinstance checks miss them."""
+    import torch.nn as _nn
+    return isinstance(m, _nn.Linear) or (
+        hasattr(m, 'in_features') and hasattr(m, 'out_features') and hasattr(m, 'weight')
+    )
+
+def count_macs_per_inference(model, T=8):
+    """Count MAC ops per inference with T spiking timesteps (Linear-only model)."""
+    import torch.nn as nn
+    macs = {}
+    for name, m in model.named_modules():
+        if _is_linear_like(m):
+            macs[name] = m.in_features * m.out_features * T
+        # Also catch CrossbarLinear (not subclass of nn.Linear)
+        elif hasattr(m, 'weight') and hasattr(m, 'in_features') and not _is_linear_like(m):
+            macs[name] = m.in_features * m.out_features * T
+        elif hasattr(m, 'crossbar') and hasattr(m.crossbar, 'weight'):
+            w = m.crossbar.weight
+            macs[name] = w.size(1) * w.size(0) * T
+    return macs
+
+
+def estimate_gpu_inference_energy(model, batch_size=1):
+    """GPU inference energy for VAE (non-spiking, T=1)."""
+    n_params = sum(p.numel() for p in model.parameters())
+    macs_dict = count_macs_per_inference(model, T=1)
+    n_macs = sum(macs_dict.values()) * batch_size
+    E_compute = n_macs * GPU_PARAMS['E_MAC']
+    n_mem = n_params * batch_size
+    miss_rate = 1 - GPU_PARAMS['cache_hit_rate']
+    E_memory = n_mem * miss_rate * GPU_PARAMS['E_DRAM'] + n_mem * GPU_PARAMS['cache_hit_rate'] * GPU_PARAMS['E_L2_cache']
+    E_total = E_compute + E_memory
+    return {'E_total_J': E_total, 'E_total_uJ': E_total * 1e6,
+            'E_compute_J': E_compute, 'E_memory_J': E_memory,
+            'n_macs': n_macs, 'n_params': n_params,
+            'breakdown': {'compute_%': E_compute/E_total*100, 'memory_%': E_memory/E_total*100}}
+
+
+def estimate_gpu_training_energy(model, steps, batch_size=1, measured_time_s=None):
+    """GPU training energy."""
+    n_params = sum(p.numel() for p in model.parameters())
+    if n_params < 100_000: util = 0.05
+    elif n_params < 1_000_000: util = 0.15
+    else: util = 0.30
+    if measured_time_s is not None:
+        E_total = GPU_PARAMS['TDP_W'] * util * measured_time_s
+    else:
+        n_macs_per_step = n_params * 6 * batch_size
+        total_macs = n_macs_per_step * steps
+        E_total = total_macs * GPU_PARAMS['E_MAC'] * (1 / util)
+    return {'E_total_J': E_total, 'E_total_mJ': E_total * 1e3,
+            'n_params': n_params, 'utilization': util, 'time_s': measured_time_s}
+
+
+def estimate_loihi_inference_energy(model, T=8, sparsity=0.1, batch_size=1):
+    """Loihi inference energy for SVAE."""
+    n_params = sum(p.numel() for p in model.parameters())
+    # Count neurons from all linear-like layers
+    n_neurons = 0
+    for m in model.modules():
+        if _is_linear_like(m):
+            n_neurons += m.out_features
+        elif hasattr(m, 'fc') and isinstance(m.fc, nn.Linear):
+            n_neurons += m.fc.out_features
+        elif hasattr(m, 'crossbar') and hasattr(m.crossbar, 'weight'):
+            n_neurons += m.crossbar.weight.size(0)
+        elif hasattr(m, 'weight') and hasattr(m, 'in_features') and not _is_linear_like(m):
+            n_neurons += m.weight.size(0)
+
+    macs_dict = count_macs_per_inference(model, T=T)
+    total_macs = sum(macs_dict.values())
+    n_syn_ops = total_macs * sparsity * batch_size
+    n_spikes = n_neurons * T * sparsity * batch_size
+    n_leak_ops = n_neurons * T * batch_size
+    E_syn = n_syn_ops * LOIHI_PARAMS['E_synapse']
+    E_spikes = n_spikes * LOIHI_PARAMS['E_spike']
+    E_leak = n_leak_ops * LOIHI_PARAMS['E_neuron_leak']
+    E_routing = n_spikes * LOIHI_PARAMS['E_router']
+    E_total = E_syn + E_spikes + E_leak + E_routing
+    return {'E_total_J': E_total, 'E_total_uJ': E_total * 1e6,
+            'E_spikes_J': E_spikes, 'E_syn_J': E_syn,
+            'E_leak_J': E_leak, 'E_routing_J': E_routing,
+            'n_params': n_params, 'n_neurons': n_neurons, 'n_spikes': n_spikes,
+            'T': T, 'sparsity': sparsity,
+            'breakdown': {
+                'spikes_%': E_spikes/E_total*100 if E_total > 0 else 0,
+                'syn_%': E_syn/E_total*100 if E_total > 0 else 0,
+                'leak_%': E_leak/E_total*100 if E_total > 0 else 0,
+                'routing_%': E_routing/E_total*100 if E_total > 0 else 0}}
+
+
+def estimate_crossbar_inference_energy(model, bits=8, T=8, sparsity=0.1, batch_size=1):
+    """Memristor crossbar inference energy for SVAE."""
+    E_ADC = MEMRISTOR_PARAMS['E_ADC_8bit'] if bits == 8 else MEMRISTOR_PARAMS['E_ADC_4bit']
+    E_DAC = MEMRISTOR_PARAMS['E_DAC_8bit'] if bits == 8 else MEMRISTOR_PARAMS['E_DAC_4bit']
+    n_params = sum(p.numel() for p in model.parameters())
+
+    total_in, total_out = 0, 0
+    for m in model.modules():
+        if _is_linear_like(m):
+            total_in += m.in_features; total_out += m.out_features
+        elif hasattr(m, 'crossbar') and hasattr(m.crossbar, 'weight'):
+            total_in += m.crossbar.weight.size(1); total_out += m.crossbar.weight.size(0)
+        elif hasattr(m, 'weight') and hasattr(m, 'in_features') and not _is_linear_like(m):
+            total_in += m.in_features; total_out += m.out_features
+
+    macs_dict = count_macs_per_inference(model, T=T)
+    total_macs = sum(macs_dict.values())
+    active_in = int(total_in * sparsity)
+    E_dac = active_in * E_DAC * T * batch_size
+    E_mvm = int(total_macs * sparsity) * MEMRISTOR_PARAMS['E_MAC_analog'] * batch_size
+    E_adc = total_out * E_ADC * T * batch_size  # NO sparsity
+    n_spikes = int(total_out * T * sparsity * batch_size)
+    E_spike = n_spikes * MEMRISTOR_PARAMS['E_spike_gen']
+    E_leak = total_out * T * batch_size * MEMRISTOR_PARAMS['E_leakage']
+    E_total = E_dac + E_mvm + E_adc + E_spike + E_leak
+    return {'E_total_J': E_total, 'E_total_uJ': E_total * 1e6,
+            'E_total_mJ': E_total * 1e3,
+            'E_dac_J': E_dac, 'E_mvm_J': E_mvm, 'E_adc_J': E_adc,
+            'E_spike_gen_J': E_spike, 'E_leak_J': E_leak,
+            'n_params': n_params, 'bits': bits, 'T': T, 'sparsity': sparsity,
+            'breakdown': {
+                'DAC_%': E_dac/E_total*100 if E_total > 0 else 0,
+                'MVM_%': E_mvm/E_total*100 if E_total > 0 else 0,
+                'ADC_%': E_adc/E_total*100 if E_total > 0 else 0,
+                'spike_gen_%': E_spike/E_total*100 if E_total > 0 else 0,
+                'leak_%': E_leak/E_total*100 if E_total > 0 else 0}}
+
+print("✓ Energy estimation functions defined (corrected: per-layer MAC counting)")
+
+
+# === cell #3 ===
+# =============================================================================
+# 4. QUANTUM UTILITIES
+# =============================================================================
+
+# Pauli matrices
+I_np = np.eye(2, dtype=np.complex128)
+X_np = np.array([[0, 1], [1, 0]], dtype=np.complex128)
+Y_np = np.array([[0, -1j], [1j, 0]], dtype=np.complex128)
+Z_np = np.array([[1, 0], [0, -1]], dtype=np.complex128)
+PAULIS = {'I': I_np, 'X': X_np, 'Y': Y_np, 'Z': Z_np}
+
+
+def pauli_op(string):
+    """Create N-qubit Pauli operator from string like 'XYZ'"""
+    out = PAULIS[string[0]]
+    for s in string[1:]:
+        out = np.kron(out, PAULIS[s])
+    return out
+
+
+def ghz_density(N):
+    """Create GHZ state density matrix: |GHZ⟩ = (|0...0⟩ + |1...1⟩)/√2"""
+    d = 2**N
+    psi = np.zeros(d, dtype=np.complex128)
+    psi[0] = 1/np.sqrt(2)
+    psi[-1] = 1/np.sqrt(2)
+    return np.outer(psi, psi.conj())
+
+
+def mixed_ghz_state(N, p=0.5):
+    """
+    Generalized Werner state (Eq. A4 from Hua et al., arXiv:2507.23007).
+
+    rho = p |GHZ><GHZ| + (1 - p) I_N / 2^N
+
+    Args:
+        N: Number of qubits
+        p: Pure-state weight (1 = pure GHZ, 0 = maximally mixed)
+
+    Returns:
+        rho: (d, d) complex128 density matrix
+    """
+    d = 2**N
+    rho_pure = ghz_density(N)
+    I_d = np.eye(d, dtype=np.complex128) / d
+    rho = p * rho_pure + (1 - p) * I_d
+    rho = 0.5 * (rho + rho.conj().T)
+    return (rho / np.real(np.trace(rho))).astype(np.complex128)
+
+
+
+def fidelity_np(rho1, rho2, eps=1e-12):
+    """Quantum fidelity between two density matrices (Uhlmann formula)."""
+    from scipy.linalg import sqrtm
+    rho1 = 0.5 * (rho1 + rho1.conj().T)
+    rho2 = 0.5 * (rho2 + rho2.conj().T)
+    sqrt_rho1 = sqrtm(rho1 + eps * np.eye(rho1.shape[0]))
+    M = sqrt_rho1 @ rho2 @ sqrt_rho1
+    M = 0.5 * (M + M.conj().T)
+    eigvals = np.linalg.eigvalsh(M)
+    eigvals = np.maximum(eigvals.real, 0)
+    F = float(np.sum(np.sqrt(eigvals))**2)
+    if F > 1.0 + 1e-6:
+        print(f"WARNING fidelity_np: F={F:.6f} > 1, possible numerical issue")
+    return float(np.clip(F, 0, 1))
+
+
+def select_paulis_nonzero(rho, N, M, tol=1e-8, tries=100):
+    """Select M Pauli operators with non-zero expectation values."""
+    from itertools import product as iterprod
+    L = 4**N
+    strings_all = [''.join(p) for p in iterprod('IXYZ', repeat=N)]
+    rng = np.random.default_rng(1234)
+    chosen, seen = [], set()
+
+    for _ in range(tries):
+        pool_sz = min(5*M + 32, L)
+        idx = rng.choice(L, size=pool_sz, replace=False)
+        for i in idx:
+            s = strings_all[i]
+            if s in seen: continue
+            A = pauli_op(s)
+            if abs(np.real(np.trace(rho @ A))) > tol:
+                chosen.append(A); seen.add(s)
+                if len(chosen) >= M: break
+        if len(chosen) >= M: break
+
+    while len(chosen) < M:
+        for s in strings_all:
+            if s not in seen:
+                chosen.append(pauli_op(s))
+                if len(chosen) >= M: break
+
+    return chosen[:M]
+
+
+def select_bases_nonzero_M2(rho, N, M, seed=0):
+    """Select M measurement bases for M2 method."""
+    rng = np.random.default_rng(seed)
+    bases = []
+    if M >= 1: bases.append('Z'*N)
+    if M >= 2: bases.append('X'*N)
+    if M >= 3: bases.append('Y'*N)
+    letters = np.array(list('XYZ'))
+    while len(bases) < M:
+        cand = ''.join(rng.choice(letters, size=N))
+        if cand not in bases: bases.append(cand)
+    return bases[:M]
+
+
+def _eigenbasis_1q(axis, device=None, dtype=torch.complex64):
+    """Get single-qubit eigenbasis transformation."""
+    if axis == 'Z':
+        return torch.eye(2, dtype=dtype, device=device)
+    elif axis == 'X':
+        return (1/torch.sqrt(torch.tensor(2., device=device))) * torch.tensor(
+            [[1,1],[1,-1]], dtype=dtype, device=device)
+    elif axis == 'Y':
+        return (1/torch.sqrt(torch.tensor(2., device=device))) * torch.tensor(
+            [[1,1],[1j,-1j]], dtype=dtype, device=device)
+    raise ValueError(f"axis must be X/Y/Z, got {axis}")
+
+
+def _kronN_torch(mats):
+    """Kronecker product of list of matrices."""
+    out = mats[0]
+    for m in mats[1:]:
+        out = torch.kron(out, m)
+    return out
+
+
+def probs_from_bases_torch(rho_ri, bases):
+    """Calculate probability distributions from density matrix in given bases."""
+    device, B, _, d, _ = rho_ri.device, *rho_ri.shape
+    N = int(math.log2(d))
+
+    with torch.amp.autocast('cuda', enabled=False):
+        rho = torch.complex(rho_ri[:,0].float(), rho_ri[:,1].float())
+        plist = []
+        for b in bases:
+            E = _kronN_torch([_eigenbasis_1q(ax, device) for ax in b])
+            Ec = E.conj().transpose(0,1)
+            rho_p = Ec @ rho @ E
+            p = rho_p.diagonal(dim1=-2, dim2=-1).real
+            p = torch.clamp(p, min=0)
+            p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            plist.append(p)
+
+    return torch.cat(plist, dim=-1)
+
+
+def fidelity_batch(rho_pred_ri, rho_true_ri, eps=1e-12):
+    """Quantum fidelity with double-precision arithmetic.
+    Uses a pure-state fast path when rho_true is pure (rank 1):
+        F = Tr(rho_true @ rho_pred)
+    For mixed target states falls back to the general Uhlmann formula
+    computed in complex128 with eigenvalues clamped to min=0 (not eps).
+    """
+    with torch.amp.autocast('cuda', enabled=False):
+        c_dtype = torch.complex128
+        rho_p = torch.complex(rho_pred_ri[:,0].double(), rho_pred_ri[:,1].double()).to(c_dtype)
+        rho_t = torch.complex(rho_true_ri[:,0].double(), rho_true_ri[:,1].double()).to(c_dtype)
+        d = rho_t.shape[-1]
+        batch_size = rho_pred_ri.shape[0]
+
+        # Pure-state fast path
+        purity = torch.real(torch.diagonal(rho_t @ rho_t, dim1=-2, dim2=-1).sum(-1))
+        is_pure = (purity > 1.0 - 1e-6)
+
+        if is_pure.all():
+            fid = torch.real(torch.diagonal(rho_t @ rho_p, dim1=-2, dim2=-1).sum(-1))
+            fid = torch.clamp(fid, min=0.0)
+            if (fid > 1.0 + 1e-6).any():
+                print(f"WARNING fidelity_batch: pure-state fidelity "
+                      f"{fid.max().item():.6f} > 1 (d={d}), possible numerical issue")
+            fid = torch.clamp(fid, max=1.0)
+            return fid, fid.mean().item()
+
+        # General Uhlmann fidelity (mixed states)
+        def sqrtm_psd(A):
+            A = 0.5*(A + A.conj().transpose(-1,-2))
+            A = A + eps * torch.eye(d, device=A.device, dtype=A.dtype)
+            try:
+                ev, V = torch.linalg.eigh(A)
+            except torch.linalg.LinAlgError as e:
+                print(f"WARNING sqrtm_psd: eigh failed (d={d}): {e}")
+                return None
+            ev = torch.clamp(ev.real, min=0.0)
+            D = torch.diag_embed(torch.sqrt(ev)).to(c_dtype)
+            return V @ D @ V.conj().transpose(-1,-2)
+
+        try:
+            sqrt_t = sqrtm_psd(rho_t)
+            if sqrt_t is None:
+                fid = torch.zeros(batch_size, device=rho_pred_ri.device)
+                return fid, 0.0
+            M = sqrt_t @ rho_p @ sqrt_t
+            M = 0.5*(M + M.conj().transpose(-1,-2))
+            ev = torch.linalg.eigvalsh(M)
+            ev = torch.clamp(ev.real, min=0.0)
+            fid = torch.sum(torch.sqrt(ev), dim=-1)**2
+            if (fid > 1.0 + 1e-6).any():
+                print(f"WARNING fidelity_batch: Uhlmann fidelity "
+                      f"{fid.max().item():.6f} > 1 (d={d}), possible numerical issue")
+            fid = torch.clamp(fid, min=0.0, max=1.0)
+        except torch.linalg.LinAlgError as e:
+            print(f"WARNING fidelity_batch: LinAlgError (d={d}): {e}")
+            fid = torch.zeros(batch_size, device=rho_pred_ri.device)
+        except RuntimeError as e:
+            print(f"WARNING fidelity_batch: RuntimeError (d={d}): {e}")
+            fid = torch.zeros(batch_size, device=rho_pred_ri.device)
+
+    return fid, fid.mean().item()
+
+print("✓ Quantum utilities defined")
+
+
+# === cell #4 ===
+# =============================================================================
+# 5. DENSITY MATRIX RECONSTRUCTION LAYERS
+# =============================================================================
+
+class DensityMap(nn.Module):
+    """
+    Maps output to valid density matrix via AA†/Tr(AA†).
+    Input: [B, 2, d, d] (real and imaginary parts)
+    Output: [B, 2, d, d] (normalized density matrix)
+    """
+    def forward(self, aa_ri):
+        Ar, Ai = aa_ri[:,0], aa_ri[:,1]
+
+        with torch.amp.autocast('cuda', enabled=False):
+            A = torch.complex(Ar.float(), Ai.float())
+            M = A @ A.conj().transpose(-1,-2)
+            M = 0.5*(M + M.conj().transpose(-1,-2))
+            tr = torch.real(torch.diagonal(M, dim1=-2, dim2=-1).sum(-1)).clamp_min(1e-12)
+            M = M / tr.view(-1,1,1)
+            result = torch.stack([M.real, M.imag], dim=1)
+
+        return result
+
+
+class ExpectationLayer(nn.Module):
+    """Calculate expectation values ⟨A⟩ = Tr(ρA) for fixed operators."""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('Acmplx', None)
+
+    @torch.no_grad()
+    def set_ops(self, ops_ri_fixed):
+        Ar = ops_ri_fixed[:, 0]
+        Ai = ops_ri_fixed[:, 1]
+        self.Acmplx = torch.complex(Ar.float(), Ai.float())
+
+    def forward(self, rho_ri, ops_ri=None):
+        with torch.amp.autocast('cuda', enabled=False):
+            rho = torch.complex(rho_ri[:,0].float(), rho_ri[:,1].float())
+            if self.Acmplx is not None and ops_ri is None:
+                tr = torch.einsum('bij,mji->bm', rho, self.Acmplx)
+            else:
+                Ar = ops_ri[:, 0].float()
+                Ai = ops_ri[:, 1].float()
+                A = torch.complex(Ar, Ai)
+                tr = torch.einsum('bij,bijm->bm', rho, A)
+            result = torch.real(tr)
+
+        return result
+
+print("✓ Density matrix layers defined")
+
+
+# === cell #5 ===
+# =============================================================================
+# 6. NORSE LIF BASE CLASSES - HARDWARE REALISTIC SPIKING NEURONS
+# =============================================================================
+
+def _poisson_st(x, gamma=1.5, pmin=0.02, pmax=0.98):
+    """
+    Poisson encoding with Straight-Through gradient.
+    Converts continuous values to spike probabilities.
+    """
+    # Standardize input
+    x_mean = x.mean()
+    x_std = x.std() + 1e-8
+    z = (x - x_mean) / x_std
+
+    # Sigmoid to get probabilities
+    p = torch.sigmoid(gamma * z)
+    p = torch.clamp(p, pmin, pmax)
+
+    # Stochastic spike generation with STE
+    spikes = (torch.rand_like(p) < p).float()
+    return p + (spikes - p).detach()
+
+
+class NorseLIFBase(nn.Module):
+    """
+    Base class for Norse LIF neurons with Loihi-compatible parameters.
+
+    Features:
+    - Hardware-realistic LIF dynamics via Norse
+    - 8-bit weight quantization (Loihi INT8)
+    - Poisson spike encoding
+    - SuperSpike surrogate gradients
+
+    Args:
+        T: Number of timesteps
+        tau_mem_inv: Membrane decay rate (1/\u03c4_mem)
+        tau_syn_inv: Synaptic decay rate (1/\u03c4_syn)
+        v_th: Firing threshold
+        return_rate: If True, return spike rate; else spike count
+        weight_bits: Weight quantization bits (8 for Loihi)
+        enc_mode: Encoding mode ('poisson' or 'none')
+        enc_gamma: Poisson encoding sharpness
+    """
+
+    def __init__(self, output_features, T=8, tau_mem_inv=100.0, tau_syn_inv=200.0,
+                 v_th=1.0, return_rate=True, weight_bits=8,
+                 enc_mode='poisson', enc_gamma=1.5, enc_pmin=0.02, enc_pmax=0.98,
+                 **kwargs):
+        super().__init__()
+
+        self.T = T
+        self.tau_mem_inv = tau_mem_inv
+        self.tau_syn_inv = tau_syn_inv
+        self.v_th = v_th
+        self.return_rate = return_rate
+        self.weight_bits = weight_bits
+        self.enc_mode = enc_mode
+        self.enc_gamma = enc_gamma
+        self.enc_pmin = enc_pmin
+        self.enc_pmax = enc_pmax
+
+        # Norse LIF parameters
+        self.lif_params = norse.LIFParameters(
+            tau_mem_inv=torch.tensor(tau_mem_inv),
+            tau_syn_inv=torch.tensor(tau_syn_inv),
+            v_th=torch.tensor(v_th),
+            v_reset=torch.tensor(0.0),
+            method="super",
+            alpha=torch.tensor(100.0)
+        )
+
+        self.lif_cell = norse.LIFCell(p=self.lif_params)
+        self.output_features = output_features
+
+    def quantize_weights(self, w):
+        """
+        Quantize weights to n-bit resolution with Straight-Through Estimator.
+        Loihi uses 8-bit signed weights.
+        """
+        if self.weight_bits >= 32:
+            return w
+
+        n_levels = 2 ** self.weight_bits
+
+        w_max = w.abs().max()
+        if w_max == 0:
+            return w
+
+        w_normalized = w / w_max
+        w_quant_norm = torch.round(w_normalized * (n_levels // 2 - 1)) / (n_levels // 2 - 1)
+        w_quant = w_quant_norm * w_max
+
+        return w + (w_quant - w).detach()
+
+    def current(self, x):
+        raise NotImplementedError
+
+    def _encode_x(self, x):
+        if self.enc_mode == 'poisson':
+            return _poisson_st(x, self.enc_gamma, self.enc_pmin, self.enc_pmax)
+        return x
+
+    def forward(self, x):
+        state = None
+        acc = None
+
+        for t in range(self.T):
+            x_encoded = self._encode_x(x)
+            I_t = self.current(x_encoded)
+            spikes, state = self.lif_cell(I_t, state)
+            if acc is None:
+                acc = torch.zeros_like(spikes)
+            acc = acc + spikes
+
+        return acc / float(self.T) if self.return_rate else acc
+
+
+class NorseLIFLinear(NorseLIFBase):
+    """Norse LIF with Linear layer and Loihi 8-bit weight quantization."""
+    def __init__(self, in_features, out_features, bias=True, **kwargs):
+        super().__init__(output_features=out_features, **kwargs)
+        self.fc = nn.Linear(in_features, out_features, bias=bias)
+
+    def current(self, x):
+        w_quant = self.quantize_weights(self.fc.weight)
+        return F.linear(x, w_quant, self.fc.bias)
+
+
+def init_normal_002(m):
+    """Initialize weights with N(0, 0.02)."""
+    if isinstance(m, nn.Linear):
+        nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
+def warm_init_spiking(model, w_scale=5.0, bias=0.2):
+    """Warm initialization for spiking networks to push neurons above threshold."""
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.mul_(w_scale)
+                if m.bias is not None:
+                    m.bias.add_(bias)
+
+print("\u2713 Norse LIF base classes defined")
+
+
+# === cell #6 ===
+# =============================================================================
+# 7. CROSSBAR LAYERS - MEMRISTOR SIMULATION
+# =============================================================================
+
+class CrossbarLinear(nn.Module):
+    """
+    Linear layer with memristor crossbar simulation.
+
+    Simulates:
+    - Weight quantization (memristor conductance levels)
+    - DAC/ADC quantization
+    - Device variation (manufacturing imperfections)
+    - Read noise (cycle-to-cycle variation)
+    - Wire resistance (IR drop)
+
+    References:
+    - Cai+ Nature Electronics 2019
+    - Yao+ Nature 2020
+    """
+
+    def __init__(self, in_features, out_features, bias=True,
+                 weight_bits=8, adc_bits=8, dac_bits=8,
+                 noise_std=0.01, device_variation=0.02, wire_resistance=0.0):
+        super().__init__()
+
+        self.weight_bits = weight_bits
+        self.adc_bits = adc_bits
+        self.dac_bits = dac_bits
+        self.noise_std = noise_std
+        self.device_variation = device_variation
+        self.wire_resistance = wire_resistance
+
+        # Learnable weights
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+        # Fixed device variation (manufacturing, doesn't change)
+        self.register_buffer('device_var_mask',
+            torch.randn(out_features, in_features) * device_variation)
+
+    def quantize_weights(self, w):
+        """Quantize weights with STE."""
+        if self.weight_bits >= 32:
+            return w
+
+        n_levels = 2 ** self.weight_bits
+        w_min = w.min()
+        w_max = w.max()
+        w_range = w_max - w_min + 1e-8
+
+        w_normalized = (w - w_min) / w_range
+        w_quant_norm = torch.round(w_normalized * (n_levels - 1)) / (n_levels - 1)
+        w_quant = w_quant_norm * w_range + w_min
+
+        return w + (w_quant - w).detach()
+
+    def add_device_variation(self, w):
+        """Add fixed device variation."""
+        if self.device_variation > 0:
+            return w * (1 + self.device_var_mask)
+        return w
+
+    def add_read_noise(self, w):
+        """Add stochastic read noise (only during training)."""
+        if self.noise_std > 0 and self.training:
+            noise = torch.randn_like(w) * self.noise_std
+            return w * (1 + noise)
+        return w
+
+    def dac_quantize(self, x):
+        """DAC: digital to analog conversion."""
+        if self.dac_bits >= 32:
+            return x
+
+        n_levels = 2 ** self.dac_bits
+        x_min = x.min()
+        x_max = x.max()
+        x_range = x_max - x_min + 1e-8
+
+        x_normalized = (x - x_min) / x_range
+        x_quant_norm = torch.round(x_normalized * (n_levels - 1)) / (n_levels - 1)
+        x_quant = x_quant_norm * x_range + x_min
+
+        return x + (x_quant - x).detach()
+
+    def adc_quantize(self, y):
+        """ADC: analog to digital conversion."""
+        if self.adc_bits >= 32:
+            return y
+
+        n_levels = 2 ** self.adc_bits
+        y_min = y.min()
+        y_max = y.max()
+        y_range = y_max - y_min + 1e-8
+
+        y_normalized = (y - y_min) / y_range
+        y_quant_norm = torch.round(y_normalized * (n_levels - 1)) / (n_levels - 1)
+        y_quant = y_quant_norm * y_range + y_min
+
+        return y + (y_quant - y).detach()
+
+    def forward(self, x):
+        # 1. DAC: Quantize input
+        x_dac = self.dac_quantize(x)
+
+        # 2. Weight quantization
+        w_quant = self.quantize_weights(self.weight)
+
+        # 3. Device variation
+        w_varied = self.add_device_variation(w_quant)
+
+        # 4. Read noise
+        w_noisy = self.add_read_noise(w_varied)
+
+        # 5. Analog MVM (this is where memristor magic happens!)
+        y = F.linear(x_dac, w_noisy, None)
+
+        # 6. ADC: Quantize output
+        y_adc = self.adc_quantize(y)
+
+        # 7. Bias (digital)
+        if self.bias is not None:
+            y_adc = y_adc + self.bias
+
+        return y_adc
+
+
+class CrossbarLIFLinear(NorseLIFBase):
+    """
+    Norse LIF neuron with memristor crossbar for synaptic weights.
+    Combines CrossbarLinear + Norse LIF dynamics.
+    """
+
+    def __init__(self, in_features, out_features, bias=True,
+                 weight_bits=8, adc_bits=8, dac_bits=8,
+                 noise_std=0.01, device_variation=0.02, **kwargs):
+
+        # Extract crossbar-specific params
+        kwargs_norse = {k: v for k, v in kwargs.items()
+                       if k not in ['weight_bits', 'adc_bits', 'dac_bits',
+                                   'noise_std', 'device_variation', 'wire_resistance']}
+
+        super().__init__(output_features=out_features, **kwargs_norse)
+
+        self.crossbar = CrossbarLinear(
+            in_features, out_features, bias=bias,
+            weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+            noise_std=noise_std, device_variation=device_variation
+        )
+
+    def current(self, x):
+        return self.crossbar(x)
+
+print("✓ Crossbar layers defined")
+
+
+# === cell #7 ===
+# =============================================================================
+# 8. VAE ARCHITECTURES - CLASSICAL BASELINE
+# =============================================================================
+
+class VAE_Encoder(nn.Module):
+    """Classical VAE Encoder: input → hidden → (mean, log_var)"""
+
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc_mean = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, x):
+        h = F.relu(self.fc1(x))
+        mean = self.fc_mean(h)
+        log_var = self.fc_logvar(h)
+        return mean, log_var
+
+
+class VAE_Decoder(nn.Module):
+    """Classical VAE Decoder: latent → hidden → output"""
+
+    def __init__(self, latent_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(latent_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, z):
+        h = F.relu(self.fc1(z))
+        return self.fc2(h)
+
+
+class VAE_QST(nn.Module):
+    """
+    Variational Autoencoder for Quantum State Tomography.
+
+    Architecture:
+    - Encoder: measurement → hidden → (μ, σ²) → z
+    - Decoder: z → hidden → density matrix elements
+    - DensityMap: elements → valid ρ via AA†/Tr(AA†)
+
+    Args:
+        cond_dim: Input dimension (M1: 12, M2: 3×2^N)
+        d: Hilbert space dimension (2^N)
+        hidden_dim: Hidden layer size
+        latent_dim: Latent space dimension
+    """
+
+    def __init__(self, cond_dim, d, hidden_dim=128, latent_dim=32):
+        super().__init__()
+        self.d = d
+        self.latent_dim = latent_dim
+        output_dim = 2 * d * d  # Real + Imag parts
+
+        self.encoder = VAE_Encoder(cond_dim, hidden_dim, latent_dim)
+        self.decoder = VAE_Decoder(latent_dim, hidden_dim, output_dim)
+        self.dm = DensityMap()
+
+        # Initialize
+        self.apply(init_normal_002)
+
+    def reparameterize(self, mean, log_var):
+        """Reparameterization trick: z = μ + σ * ε, ε ~ N(0,1)"""
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def forward(self, x):
+        # Encode
+        mean, log_var = self.encoder(x)
+
+        # Reparameterize
+        z = self.reparameterize(mean, log_var)
+
+        # Decode
+        out = self.decoder(z)
+
+        # Reshape to [B, 2, d, d]
+        out = out.view(-1, 2, self.d, self.d)
+
+        # Map to valid density matrix
+        rho = self.dm(out)
+
+        return rho, mean, log_var
+
+    def loss_function(self, rho_pred, rho_true, mean, log_var, beta=1.0):
+        """
+        VAE Loss = Reconstruction Loss + β × KL Divergence
+        """
+        # Reconstruction loss (MSE on density matrix elements)
+        recon_loss = F.mse_loss(rho_pred, rho_true)
+
+        # KL divergence: -0.5 * Σ(1 + log(σ²) - μ² - σ²)
+        kl_loss = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
+
+        return recon_loss + beta * kl_loss, recon_loss, kl_loss
+
+print("✓ Classical VAE architecture defined")
+
+
+# === cell #8 ===
+# =============================================================================
+# 9. SVAE ARCHITECTURES - SPIKING VAE WITH NORSE LIF
+# =============================================================================
+
+class SVAE_Encoder_Norse(nn.Module):
+    """
+    Spiking VAE Encoder using Norse LIF neurons.
+    Outputs spike rates that encode mean and log_var.
+    """
+
+    def __init__(self, input_dim, hidden_dim, latent_dim,
+                 T=8, tau_mem_inv=100.0, tau_syn_inv=200.0, v_th=1.0,
+                 weight_bits=8, enc_mode='poisson', enc_gamma=1.5):
+        super().__init__()
+
+        kw = dict(T=T, tau_mem_inv=tau_mem_inv, tau_syn_inv=tau_syn_inv,
+                  v_th=v_th, return_rate=True, weight_bits=weight_bits,
+                  enc_mode=enc_mode, enc_gamma=enc_gamma)
+
+        self.lif1 = NorseLIFLinear(input_dim, hidden_dim, **kw)
+        self.fc_mean = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, x):
+        # Spiking hidden layer
+        h = self.lif1(x)  # Returns spike rate
+
+        # Linear readout for mean/logvar
+        mean = self.fc_mean(h)
+        log_var = self.fc_logvar(h)
+
+        return mean, log_var
+
+
+class SVAE_Decoder_Norse(nn.Module):
+    """
+    Spiking VAE Decoder using Norse LIF neurons.
+    """
+
+    def __init__(self, latent_dim, hidden_dim, output_dim,
+                 T=8, tau_mem_inv=100.0, tau_syn_inv=200.0, v_th=1.0,
+                 weight_bits=8, enc_mode='poisson', enc_gamma=1.5):
+        super().__init__()
+
+        kw = dict(T=T, tau_mem_inv=tau_mem_inv, tau_syn_inv=tau_syn_inv,
+                  v_th=v_th, return_rate=True, weight_bits=weight_bits,
+                  enc_mode=enc_mode, enc_gamma=enc_gamma)
+
+        self.lif1 = NorseLIFLinear(latent_dim, hidden_dim, **kw)
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, z):
+        h = self.lif1(z)
+        return self.fc_out(h)
+
+
+class SVAE_QST_Norse(nn.Module):
+    """
+    Spiking Variational Autoencoder for QST using Norse LIF.
+    Target hardware: Intel Loihi with 8-bit weight quantization.
+
+    Args:
+        cond_dim: Input dimension
+        d: Hilbert space dimension
+        hidden_dim: Hidden layer size
+        latent_dim: Latent space dimension
+        T: Number of timesteps
+        tau_mem_inv: Membrane decay rate
+        tau_syn_inv: Synaptic decay rate
+        v_th: Firing threshold
+        weight_bits: Weight quantization (8 for Loihi)
+        enc_mode: Spike encoding mode
+        enc_gamma: Encoding sharpness
+    """
+
+    def __init__(self, cond_dim, d, hidden_dim=128, latent_dim=32,
+                 T=8, tau_mem_inv=100.0, tau_syn_inv=200.0, v_th=1.0,
+                 weight_bits=8, enc_mode='poisson', enc_gamma=1.5):
+        super().__init__()
+        self.d = d
+        self.latent_dim = latent_dim
+        output_dim = 2 * d * d
+
+        enc_kw = dict(T=T, tau_mem_inv=tau_mem_inv, tau_syn_inv=tau_syn_inv,
+                      v_th=v_th, weight_bits=weight_bits, enc_mode=enc_mode,
+                      enc_gamma=enc_gamma)
+
+        self.encoder = SVAE_Encoder_Norse(cond_dim, hidden_dim, latent_dim, **enc_kw)
+        self.decoder = SVAE_Decoder_Norse(latent_dim, hidden_dim, output_dim, **enc_kw)
+        self.dm = DensityMap()
+
+        # Initialize weights only. warm_init_spiking is called once by
+        # optimize_single_state(warm_spiking=True), NOT here, to avoid
+        # double-scaling weights (5x * 5x = 25x would saturate all neurons).
+        self.apply(init_normal_002)
+
+    def reparameterize(self, mean, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def forward(self, x):
+        mean, log_var = self.encoder(x)
+        z = self.reparameterize(mean, log_var)
+        out = self.decoder(z)
+        out = out.view(-1, 2, self.d, self.d)
+        rho = self.dm(out)
+        return rho, mean, log_var
+
+    def loss_function(self, rho_pred, rho_true, mean, log_var, beta=1.0):
+        recon_loss = F.mse_loss(rho_pred, rho_true)
+        kl_loss = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
+        return recon_loss + beta * kl_loss, recon_loss, kl_loss
+
+print("\u2713 SVAE Norse (Loihi) architecture defined")
+
+
+# === cell #9 ===
+# =============================================================================
+# 10. SVAE ARCHITECTURES - CROSSBAR (MEMRISTOR)
+# =============================================================================
+
+class SVAE_Encoder_Crossbar(nn.Module):
+    """
+    Spiking VAE Encoder with memristor crossbar.
+    """
+
+    def __init__(self, input_dim, hidden_dim, latent_dim,
+                 T=8, tau_mem_inv=100.0, tau_syn_inv=200.0, v_th=1.0,
+                 weight_bits=8, adc_bits=8, dac_bits=8,
+                 noise_std=0.01, device_variation=0.02,
+                 enc_mode='poisson', enc_gamma=1.5):
+        super().__init__()
+
+        kw = dict(T=T, tau_mem_inv=tau_mem_inv, tau_syn_inv=tau_syn_inv,
+                  v_th=v_th, return_rate=True,
+                  weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+                  noise_std=noise_std, device_variation=device_variation,
+                  enc_mode=enc_mode, enc_gamma=enc_gamma)
+
+        self.lif1 = CrossbarLIFLinear(input_dim, hidden_dim, **kw)
+
+        # Readout layers also use crossbar
+        self.crossbar_mean = CrossbarLinear(
+            hidden_dim, latent_dim,
+            weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+            noise_std=noise_std, device_variation=device_variation
+        )
+        self.crossbar_logvar = CrossbarLinear(
+            hidden_dim, latent_dim,
+            weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+            noise_std=noise_std, device_variation=device_variation
+        )
+
+    def forward(self, x):
+        h = self.lif1(x)
+        mean = self.crossbar_mean(h)
+        log_var = self.crossbar_logvar(h)
+        return mean, log_var
+
+
+class SVAE_Decoder_Crossbar(nn.Module):
+    """
+    Spiking VAE Decoder with memristor crossbar.
+    """
+
+    def __init__(self, latent_dim, hidden_dim, output_dim,
+                 T=8, tau_mem_inv=100.0, tau_syn_inv=200.0, v_th=1.0,
+                 weight_bits=8, adc_bits=8, dac_bits=8,
+                 noise_std=0.01, device_variation=0.02,
+                 enc_mode='poisson', enc_gamma=1.5):
+        super().__init__()
+
+        kw = dict(T=T, tau_mem_inv=tau_mem_inv, tau_syn_inv=tau_syn_inv,
+                  v_th=v_th, return_rate=True,
+                  weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+                  noise_std=noise_std, device_variation=device_variation,
+                  enc_mode=enc_mode, enc_gamma=enc_gamma)
+
+        self.lif1 = CrossbarLIFLinear(latent_dim, hidden_dim, **kw)
+
+        self.crossbar_out = CrossbarLinear(
+            hidden_dim, output_dim,
+            weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+            noise_std=noise_std, device_variation=device_variation
+        )
+
+    def forward(self, z):
+        h = self.lif1(z)
+        return self.crossbar_out(h)
+
+
+class SVAE_QST_Crossbar(nn.Module):
+    """
+    Spiking VAE for QST with memristor crossbar simulation.
+    Target hardware: Memristor-based CiM accelerator.
+
+    Args:
+        cond_dim: Input dimension
+        d: Hilbert space dimension
+        hidden_dim: Hidden layer size
+        latent_dim: Latent space dimension
+        T: Number of timesteps
+        weight_bits: Weight quantization (8 or 4)
+        adc_bits: ADC resolution
+        dac_bits: DAC resolution
+        noise_std: Read noise std
+        device_variation: Manufacturing variation
+    """
+
+    def __init__(self, cond_dim, d, hidden_dim=128, latent_dim=32,
+                 T=8, tau_mem_inv=100.0, tau_syn_inv=200.0, v_th=1.0,
+                 weight_bits=8, adc_bits=8, dac_bits=8,
+                 noise_std=0.01, device_variation=0.02,
+                 enc_mode='poisson', enc_gamma=1.5):
+        super().__init__()
+        self.d = d
+        self.latent_dim = latent_dim
+        self.weight_bits = weight_bits
+        output_dim = 2 * d * d
+
+        enc_kw = dict(
+            T=T, tau_mem_inv=tau_mem_inv, tau_syn_inv=tau_syn_inv, v_th=v_th,
+            weight_bits=weight_bits, adc_bits=adc_bits, dac_bits=dac_bits,
+            noise_std=noise_std, device_variation=device_variation,
+            enc_mode=enc_mode, enc_gamma=enc_gamma
+        )
+
+        self.encoder = SVAE_Encoder_Crossbar(cond_dim, hidden_dim, latent_dim, **enc_kw)
+        self.decoder = SVAE_Decoder_Crossbar(latent_dim, hidden_dim, output_dim, **enc_kw)
+        self.dm = DensityMap()
+
+        # Note: init_normal_002 and warm_init_spiking only affect nn.Linear
+        # layers, which CrossbarLinear is not (it uses nn.Parameter directly).
+        # These calls are kept for consistency but are effectively no-ops here.
+        self.apply(init_normal_002)
+
+    def reparameterize(self, mean, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mean + eps * std
+
+    def forward(self, x):
+        mean, log_var = self.encoder(x)
+        z = self.reparameterize(mean, log_var)
+        out = self.decoder(z)
+        out = out.view(-1, 2, self.d, self.d)
+        rho = self.dm(out)
+        return rho, mean, log_var
+
+    def loss_function(self, rho_pred, rho_true, mean, log_var, beta=1.0):
+        recon_loss = F.mse_loss(rho_pred, rho_true)
+        kl_loss = -0.5 * torch.mean(1 + log_var - mean.pow(2) - log_var.exp())
+        return recon_loss + beta * kl_loss, recon_loss, kl_loss
+
+print("\u2713 SVAE Crossbar (Memristor) architecture defined")
+
+
+# === cell #10 ===
+# =============================================================================
+# 11. TRAINING FUNCTIONS
+# =============================================================================
+
+def optimize_single_state(model_class, N, method='M1', M=12, steps=400,
+                          lr=1e-3, beta_vae=1.0, warm_spiking=False,
+                          use_amp=True, log_interval=100):
+    """
+    Train a VAE/SVAE model to reconstruct a single GHZ state.
+
+    Args:
+        model_class: Model constructor function
+        N: Number of qubits
+        method: 'M1' (expectation) or 'M2' (probability)
+        M: Number of measurements
+        steps: Training steps
+        lr: Learning rate
+        beta_vae: KL divergence weight
+        warm_spiking: Apply warm initialization for spiking models
+        use_amp: Use automatic mixed precision
+        log_interval: Logging frequency
+
+    Returns:
+        dict with results
+    """
+    d = 2**N
+
+    # Create target state: Mixed GHZ (Werner state, p=0.5)
+    rho_np = mixed_ghz_state(N, p=0.5)
+    rho_ri = torch.stack([torch.from_numpy(rho_np.real).float(),
+                          torch.from_numpy(rho_np.imag).float()], dim=0)
+    rho_ri = rho_ri.unsqueeze(0).to(DEVICE)  # [1, 2, d, d]
+
+    # Setup measurement operators/bases
+    if method == 'M1':
+        ops = select_paulis_nonzero(rho_np, N, M)
+        ops_np = np.stack(ops)
+        ops_ri = torch.stack([torch.from_numpy(ops_np.real).float(),
+                              torch.from_numpy(ops_np.imag).float()], dim=1).to(DEVICE)
+        exp_layer = ExpectationLayer()
+        exp_layer.set_ops(ops_ri)
+        exp_layer = exp_layer.to(DEVICE)
+
+        # Calculate target expectations
+        with torch.no_grad():
+            cond = exp_layer(rho_ri)  # [1, M]
+        cond_dim = M
+        bases = None
+    else:  # M2
+        bases = select_bases_nonzero_M2(rho_np, N, M)
+        with torch.no_grad():
+            cond = probs_from_bases_torch(rho_ri, bases)  # [1, M*d]
+        cond_dim = M * d
+        exp_layer = None
+
+    # Create model
+    model = model_class(cond_dim, d).to(DEVICE)
+
+    if warm_spiking:
+        warm_init_spiking(model)
+
+    # Optimizer and scaler
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scaler = GradScaler() if use_amp and DEVICE.type == 'cuda' else None
+
+    # Training loop
+    F_hist = []
+    loss_hist = []
+    best_F = 0.0
+    best_state = None
+
+    t0 = time.time()
+
+    for step in range(1, steps + 1):
+        model.train()
+        optimizer.zero_grad()
+
+        if scaler is not None:
+            with autocast():
+                rho_pred, mean, log_var = model(cond)
+                loss, recon_loss, kl_loss = model.loss_function(
+                    rho_pred, rho_ri, mean, log_var, beta=beta_vae)
+
+            scaler.scale(loss).backward()
+            # Gradient clipping to prevent NaN
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            rho_pred, mean, log_var = model(cond)
+            loss, recon_loss, kl_loss = model.loss_function(
+                rho_pred, rho_ri, mean, log_var, beta=beta_vae)
+            loss.backward()
+            # Gradient clipping to prevent NaN
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        # Evaluate fidelity
+        model.eval()
+        with torch.no_grad():
+            rho_pred_eval, _, _ = model(cond)
+            _, F_mean = fidelity_batch(rho_pred_eval, rho_ri)
+
+        F_hist.append(F_mean)
+        loss_hist.append(loss.item())
+
+        if F_mean > best_F:
+            best_F = F_mean
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if step % log_interval == 0:
+            print(f"    Step {step}: Loss={loss.item():.6f}, F={F_mean:.4f}")
+
+    elapsed = time.time() - t0
+
+    # Restore best model
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model = model.to(DEVICE)
+
+    return {
+        'model': model,
+        'F_best': best_F,
+        'F_hist': F_hist,
+        'loss_hist': loss_hist,
+        'time_sec': elapsed,
+        'config': {'N': N, 'method': method, 'M': M, 'steps': steps}
+    }
+
+print("✓ Training functions defined")
+
+
+# === cell #11 ===
+# =============================================================================
+# 12. COMPLETE BENCHMARK FUNCTION
+# =============================================================================
+
+def run_vae_svae_benchmark(N_list=[3, 4, 5], methods=['M1', 'M2'],
+                           M_M1=256, M_M2=4, steps=500, lr=1e-3,
+                           crossbar_bits=[8, 4], use_amp=True,
+                           sparsity=0.1):
+    """
+    Run complete benchmark comparing VAE vs SVAE architectures.
+
+    Models tested:
+    1. VAE (GPU) - Classical baseline
+    2. SVAE-Norse (Loihi) - Spiking with Norse LIF
+    3. SVAE-Crossbar-8bit - Memristor with 8-bit quantization
+    4. SVAE-Crossbar-4bit - Memristor with 4-bit quantization
+
+    Returns:
+        dict with all results organized by model type
+    """
+
+    all_results = {
+        'VAE': defaultdict(list),
+        'SVAE-Norse': defaultdict(list),
+        'SVAE-Crossbar': {bits: defaultdict(list) for bits in crossbar_bits}
+    }
+
+    for method in methods:
+        M = M_M1 if method == 'M1' else M_M2
+
+        print(f"\n{'='*70}")
+        print(f"\U0001f680 BENCHMARK: {method} (M={M})")
+        print(f"{'='*70}")
+
+        for N in N_list:
+            d = 2**N
+            cond_dim = M if method == 'M1' else M * d
+
+            sep = "\u2500"*60
+            print(f"\n{sep}")
+            print(f"\U0001f52c N={N} qubits (d={d}, cond_dim={cond_dim})")
+            print(sep)
+
+            # T=8 optimal from mixed-state T-sweep study.
+            # Norse LIF parameters kept from pure-state SVAE defaults.
+            current_T = 8       # T-sweep validated
+            current_vth = 1.0   # SVAE Norse default
+            current_gamma = 1.5 # SVAE Norse default
+            current_steps = steps
+
+            # Hidden/latent dimensions scale with N
+            hidden_dim = max(64, min(256, 32 * N))
+            latent_dim = max(16, min(64, 8 * N))
+
+            # ================================================================
+            # 1. VAE (GPU Baseline)
+            # ================================================================
+            print(f"\n1\ufe0f\u20e3  VAE (GPU)")
+
+            model_fn_vae = lambda cd, d_: VAE_QST(
+                cond_dim=cd, d=d_, hidden_dim=hidden_dim, latent_dim=latent_dim)
+
+            res = optimize_single_state(
+                model_class=model_fn_vae, N=N, method=method, M=M,
+                steps=current_steps, lr=lr, warm_spiking=False, use_amp=use_amp
+            )
+
+            model = res['model']
+            E_inf = estimate_gpu_inference_energy(model)
+            E_train = estimate_gpu_training_energy(model, current_steps, measured_time_s=res['time_sec'])
+
+            all_results['VAE'][method].append({
+                'Model': 'VAE', 'N': N, 'method': method,
+                'F_best': res['F_best'],
+                'E_inference_uJ': E_inf['E_total_uJ'],
+                'E_training_mJ': E_train['E_total_mJ'],
+                'n_params': E_inf['n_params'],
+                'Time_sec': res['time_sec'],
+                'HW_inference': 'GPU',
+                'F_hist': res['F_hist'],
+            })
+            print(f"    F={res['F_best']:.4f}, E_inf={E_inf['E_total_uJ']:.2f}\u00b5J, "
+                  f"E_train={E_train['E_total_mJ']:.1f}mJ, Time={res['time_sec']:.1f}s")
+
+            # ================================================================
+            # 2. SVAE-Norse (Loihi)
+            # ================================================================
+            print(f"\n2\ufe0f\u20e3  SVAE-Norse (Loihi)")
+
+            model_fn_norse = lambda cd, d_: SVAE_QST_Norse(
+                cond_dim=cd, d=d_, hidden_dim=hidden_dim, latent_dim=latent_dim,
+                T=current_T, v_th=current_vth, enc_gamma=current_gamma)
+
+            res = optimize_single_state(
+                model_class=model_fn_norse, N=N, method=method, M=M,
+                steps=current_steps, lr=lr, beta_vae=0.1,
+                warm_spiking=True, use_amp=use_amp
+            )
+
+            model = res['model']
+            E_inf = estimate_loihi_inference_energy(model, T=current_T, sparsity=sparsity)
+            E_train = estimate_gpu_training_energy(model, current_steps, measured_time_s=res['time_sec'])
+
+            all_results['SVAE-Norse'][method].append({
+                'Model': 'SVAE-Norse', 'N': N, 'method': method,
+                'F_best': res['F_best'],
+                'E_inference_uJ': E_inf['E_total_uJ'],
+                'E_training_mJ': E_train['E_total_mJ'],
+                'n_params': E_inf['n_params'],
+                'n_neurons': E_inf['n_neurons'],
+                'n_spikes': E_inf['n_spikes'],
+                'Time_sec': res['time_sec'],
+                'HW_inference': 'Loihi',
+                'T': current_T,
+                'sparsity': sparsity,
+                'breakdown': E_inf['breakdown'],
+                'F_hist': res['F_hist'],
+            })
+            print(f"    F={res['F_best']:.4f}, E_inf={E_inf['E_total_uJ']:.4f}\u00b5J (Loihi), "
+                  f"E_train={E_train['E_total_mJ']:.1f}mJ, Time={res['time_sec']:.1f}s")
+
+            # ================================================================
+            # 3. SVAE-Crossbar (Memristor)
+            # ================================================================
+            print(f"\n3\ufe0f\u20e3  SVAE-Crossbar (Memristor)")
+
+            for bits in crossbar_bits:
+                print(f"\n  \U0001f4ca {bits}-bit quantization")
+
+                # Crossbar parameters: low v_th and high gamma work here
+                # because the crossbar's quantization noise + device variation
+                # act as implicit regularization, and beta_vae=0.1 reduces
+                # KL pressure on the latent space.
+                if bits == 8:
+                    noise_std = 0.001
+                    device_var = 0.003
+                    cb_steps = steps
+                    cb_T = 8  # T-sweep validated
+                    if N <= 6:
+                        cb_vth = 0.3
+                        cb_gamma = 3.0
+                    elif N == 7:
+                        cb_vth = 0.25
+                        cb_gamma = 4.0
+                    else:  # N >= 8
+                        cb_vth = 0.2
+                        cb_gamma = 5.0
+                else:  # 4-bit
+                    noise_std = 0.001
+                    device_var = 0.003
+                    cb_steps = steps
+                    cb_T = 8  # T-sweep validated
+                    if N <= 6:
+                        cb_vth = 0.3
+                        cb_gamma = 3.5
+                    elif N == 7:
+                        cb_vth = 0.2
+                        cb_gamma = 5.0
+                    else:  # N >= 8
+                        cb_vth = 0.15
+                        cb_gamma = 6.0
+
+                print(f"    noise={noise_std}, var={device_var}, v_th={cb_vth}, T={cb_T}, steps={cb_steps}")
+
+                model_fn_cb = lambda cd, d_, _bits=bits, _noise=noise_std, _var=device_var, _vth=cb_vth, _gamma=cb_gamma, _T=cb_T: SVAE_QST_Crossbar(
+                    cond_dim=cd, d=d_, hidden_dim=hidden_dim, latent_dim=latent_dim,
+                    T=_T, v_th=_vth, enc_gamma=_gamma,
+                    weight_bits=_bits, adc_bits=_bits, dac_bits=_bits,
+                    noise_std=_noise, device_variation=_var)
+
+                res = optimize_single_state(
+                    model_class=model_fn_cb, N=N, method=method, M=M,
+                    steps=cb_steps, lr=lr, beta_vae=0.1, warm_spiking=True, use_amp=use_amp
+                )
+
+                model = res['model']
+                E_inf = estimate_crossbar_inference_energy(model, bits=bits, T=current_T, sparsity=sparsity)
+                E_train = estimate_gpu_training_energy(model, current_steps, measured_time_s=res['time_sec'])
+
+                all_results['SVAE-Crossbar'][bits][method].append({
+                    'Model': f'SVAE-Crossbar-{bits}b', 'N': N, 'method': method,
+                    'F_best': res['F_best'],
+                    'E_inference_uJ': E_inf['E_total_uJ'],
+                    'E_training_mJ': E_train['E_total_mJ'],
+                    'n_params': E_inf['n_params'],
+                    'Time_sec': res['time_sec'],
+                    'HW_inference': f'Crossbar-{bits}b',
+                    'bits': bits,
+                    'T': current_T,
+                    'sparsity': sparsity,
+                    'breakdown': E_inf['breakdown'],
+                    'F_hist': res['F_hist'],
+                })
+                print(f"    F={res['F_best']:.4f}, E_inf={E_inf['E_total_uJ']:.4f}\u00b5J, "
+                      f"E_train={E_train['E_total_mJ']:.1f}mJ, Time={res['time_sec']:.1f}s")
+                print(f"    ADC dominance: {E_inf['breakdown']['ADC_%']:.1f}%")
+
+    return all_results
+
+print("\u2713 Benchmark function defined")
+
+
+# === cell #12 ===
+# =============================================================================
+# 13. PLOTTING FUNCTIONS
+# =============================================================================
+
+def plot_vae_svae_benchmark(results, method_name='M1', save_prefix='svae_benchmark'):
+    """
+    Generate comprehensive plots for VAE vs SVAE benchmark.
+    """
+
+    # Colors and markers
+    COLORS = {
+        'VAE': '#1f77b4',
+        'SVAE-Norse': '#2ca02c',
+        'SVAE-Crossbar-8b': '#ff7f0e',
+        'SVAE-Crossbar-4b': '#d62728',
+    }
+
+    MARKERS = {
+        'VAE': 'o',
+        'SVAE-Norse': '^',
+        'SVAE-Crossbar-8b': 'D',
+        'SVAE-Crossbar-4b': 'p',
+    }
+
+    # Collect data
+    data_by_model = defaultdict(lambda: {'N': [], 'F': [], 'E_inf': [], 'E_train': []})
+
+    # VAE
+    for r in results['VAE'].get(method_name, []):
+        data_by_model['VAE']['N'].append(r['N'])
+        data_by_model['VAE']['F'].append(r['F_best'])
+        data_by_model['VAE']['E_inf'].append(r['E_inference_uJ'])
+        data_by_model['VAE']['E_train'].append(r['E_training_mJ'])
+
+    # SVAE-Norse
+    for r in results['SVAE-Norse'].get(method_name, []):
+        data_by_model['SVAE-Norse']['N'].append(r['N'])
+        data_by_model['SVAE-Norse']['F'].append(r['F_best'])
+        data_by_model['SVAE-Norse']['E_inf'].append(r['E_inference_uJ'])
+        data_by_model['SVAE-Norse']['E_train'].append(r['E_training_mJ'])
+
+    # Crossbar
+    for bits in results['SVAE-Crossbar'].keys():
+        model_name = f'SVAE-Crossbar-{bits}b'
+        for r in results['SVAE-Crossbar'][bits].get(method_name, []):
+            data_by_model[model_name]['N'].append(r['N'])
+            data_by_model[model_name]['F'].append(r['F_best'])
+            data_by_model[model_name]['E_inf'].append(r['E_inference_uJ'])
+            data_by_model[model_name]['E_train'].append(r['E_training_mJ'])
+
+    # Sort by N
+    for model in data_by_model:
+        if len(data_by_model[model]['N']) > 0:
+            idx = np.argsort(data_by_model[model]['N'])
+            for key in ['N', 'F', 'E_inf', 'E_train']:
+                data_by_model[model][key] = [data_by_model[model][key][i] for i in idx]
+
+    # Create figure with 2x2 subplots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'VAE vs SVAE Energy Benchmark (Mixed GHZ) - {method_name}', fontsize=14, fontweight='bold')
+
+    # Plot 1: Fidelity vs N
+    ax = axes[0, 0]
+    for model in data_by_model:
+        if len(data_by_model[model]['N']) > 0:
+            ax.plot(data_by_model[model]['N'], data_by_model[model]['F'],
+                   marker=MARKERS.get(model, 'o'), color=COLORS.get(model, 'gray'),
+                   label=model, linewidth=2, markersize=8)
+    ax.set_xlabel('Number of Qubits (N)')
+    ax.set_ylabel('Fidelity')
+    ax.set_title('Reconstruction Fidelity')
+    ax.legend(loc='lower left')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0.3, 1.02])
+
+    # Plot 2: Inference Energy vs N (log scale)
+    ax = axes[0, 1]
+    for model in data_by_model:
+        if len(data_by_model[model]['N']) > 0:
+            ax.semilogy(data_by_model[model]['N'], data_by_model[model]['E_inf'],
+                       marker=MARKERS.get(model, 'o'), color=COLORS.get(model, 'gray'),
+                       label=model, linewidth=2, markersize=8)
+    ax.set_xlabel('Number of Qubits (N)')
+    ax.set_ylabel('Inference Energy (µJ)')
+    ax.set_title('Inference Energy (log scale)')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3, which='both')
+
+    # Plot 3: Energy Speedup vs VAE baseline
+    ax = axes[1, 0]
+    if len(data_by_model['VAE']['N']) > 0:
+        baseline_E = dict(zip(data_by_model['VAE']['N'], data_by_model['VAE']['E_inf']))
+        for model in data_by_model:
+            if model != 'VAE' and len(data_by_model[model]['N']) > 0:
+                speedups = []
+                Ns = []
+                for i, n in enumerate(data_by_model[model]['N']):
+                    if n in baseline_E and data_by_model[model]['E_inf'][i] > 0:
+                        speedups.append(baseline_E[n] / data_by_model[model]['E_inf'][i])
+                        Ns.append(n)
+                if len(Ns) > 0:
+                    ax.semilogy(Ns, speedups,
+                               marker=MARKERS.get(model, 'o'), color=COLORS.get(model, 'gray'),
+                               label=model, linewidth=2, markersize=8)
+    ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5, label='Baseline (VAE)')
+    ax.set_xlabel('Number of Qubits (N)')
+    ax.set_ylabel('Energy Speedup vs VAE (×)')
+    ax.set_title('Energy Efficiency Improvement')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3, which='both')
+
+    # Plot 4: Fidelity vs Energy (Pareto front)
+    ax = axes[1, 1]
+    for model in data_by_model:
+        if len(data_by_model[model]['N']) > 0:
+            ax.scatter(data_by_model[model]['E_inf'], data_by_model[model]['F'],
+                      marker=MARKERS.get(model, 'o'), c=COLORS.get(model, 'gray'),
+                      label=model, s=100, alpha=0.7)
+    ax.set_xscale('log')
+    ax.set_xlabel('Inference Energy (µJ)')
+    ax.set_ylabel('Fidelity')
+    ax.set_title('Fidelity vs Energy Trade-off')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3, which='both')
+
+    plt.tight_layout()
+    plt.savefig(f'{save_prefix}_{method_name}.png', dpi=150, bbox_inches='tight')
+
+    return data_by_model
+
+
+def plot_energy_breakdown(results, method_name='M1', save_prefix='svae_breakdown'):
+    """
+    Plot energy breakdown for crossbar models (ADC/DAC/MVM).
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for idx, bits in enumerate([8, 4]):
+        ax = axes[idx]
+
+        data = results['SVAE-Crossbar'].get(bits, {}).get(method_name, [])
+        if len(data) == 0:
+            continue
+
+        N_vals = [r['N'] for r in data]
+        adc_pct = [r['breakdown']['ADC_%'] for r in data]
+        dac_pct = [r['breakdown']['DAC_%'] for r in data]
+        mvm_pct = [r['breakdown']['MVM_%'] for r in data]
+        spike_pct = [r['breakdown']['spike_gen_%'] for r in data]
+
+        x = np.arange(len(N_vals))
+        width = 0.6
+
+        ax.bar(x, adc_pct, width, label='ADC', color='#e74c3c')
+        ax.bar(x, dac_pct, width, bottom=adc_pct, label='DAC', color='#3498db')
+        bottom2 = [a + d for a, d in zip(adc_pct, dac_pct)]
+        ax.bar(x, mvm_pct, width, bottom=bottom2, label='MVM (analog)', color='#2ecc71')
+        bottom3 = [b + m for b, m in zip(bottom2, mvm_pct)]
+        ax.bar(x, spike_pct, width, bottom=bottom3, label='Spike Gen', color='#9b59b6')
+
+        ax.set_xlabel('Number of Qubits (N)')
+        ax.set_ylabel('Energy Breakdown (%)')
+        ax.set_title(f'SVAE-Crossbar-{bits}b Energy Breakdown')
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'N={n}' for n in N_vals])
+        ax.legend(loc='upper right')
+        ax.set_ylim([0, 105])
+
+    plt.tight_layout()
+    plt.savefig(f'{save_prefix}_{method_name}.png', dpi=150, bbox_inches='tight')
+
+
+def create_results_table(results, method_name='M1'):
+    """
+    Create a summary DataFrame of all results.
+    """
+    rows = []
+
+    # VAE baseline
+    for r in results['VAE'].get(method_name, []):
+        rows.append({
+            'seed': SEED,
+            'Model': 'VAE (GPU)',
+            'N': r['N'],
+            'Fidelity': r['F_best'],
+            'E_inf (µJ)': r['E_inference_uJ'],
+            'Speedup': 1.0,
+            'Hardware': 'GPU'
+        })
+
+    # Get VAE baseline for speedup calculation
+    vae_baseline = {r['N']: r['E_inference_uJ'] for r in results['VAE'].get(method_name, [])}
+
+    # SVAE-Norse
+    for r in results['SVAE-Norse'].get(method_name, []):
+        speedup = vae_baseline.get(r['N'], 1) / r['E_inference_uJ'] if r['E_inference_uJ'] > 0 else 0
+        rows.append({
+            'seed': SEED,
+            'Model': 'SVAE (Loihi)',
+            'N': r['N'],
+            'Fidelity': r['F_best'],
+            'E_inf (µJ)': r['E_inference_uJ'],
+            'Speedup': speedup,
+            'Hardware': 'Loihi'
+        })
+
+    # Crossbar
+    for bits in results['SVAE-Crossbar'].keys():
+        for r in results['SVAE-Crossbar'][bits].get(method_name, []):
+            speedup = vae_baseline.get(r['N'], 1) / r['E_inference_uJ'] if r['E_inference_uJ'] > 0 else 0
+            rows.append({
+                'seed': SEED,
+                'Model': f'SVAE (Crossbar-{bits}b)',
+                'N': r['N'],
+                'Fidelity': r['F_best'],
+                'E_inf (µJ)': r['E_inference_uJ'],
+                'Speedup': speedup,
+                'Hardware': f'Crossbar-{bits}b'
+            })
+
+    df = pd.DataFrame(rows)
+    return df.sort_values(['N', 'Model'])
+
+print("✓ Plotting functions defined")
+
+
+# === cell #13 ===
+# =============================================================================
+# 14. RUN BENCHMARK M1
+# =============================================================================
+
+print("\n" + "="*80)
+print("\U0001f680 STARTING VAE vs SVAE BENCHMARK - MIXED GHZ STATES")
+print("="*80)
+print("\nTarget: Werner state rho = 0.5|GHZ><GHZ| + 0.5*I/d")
+print("\nThis will compare:")
+print("  1. VAE (classical, GPU)")
+print("  2. SVAE-Norse (spiking, Loihi target)")
+print("  3. SVAE-Crossbar (spiking + memristor, 8-bit and 4-bit)")
+print("\n" + "="*80)
+
+# Run M1 benchmark
+if _seed_done('M1'):
+    print(f"[multiseed] seed={SEED} method=M1 already done — skipping", flush=True)
+    results_M1 = None
+else:
+    if _ARGS.quick:
+        results_M1 = run_vae_svae_benchmark(
+            N_list=[3],
+            methods=['M1'],
+            M_M1=256,           # M-sweep validated
+            M_M2=4,             # M-sweep validated
+            steps=3,
+            lr=1e-3,
+            crossbar_bits=[8, 4],
+            use_amp=True,
+            sparsity=0.1
+        )
+
+    else:
+        results_M1 = run_vae_svae_benchmark(
+            N_list=[3, 4, 5, 6, 7, 8],
+            methods=['M1'],
+            M_M1=256,           # M-sweep validated
+            M_M2=4,             # M-sweep validated
+            steps=500,
+            lr=1e-3,
+            crossbar_bits=[8, 4],
+            use_amp=True,
+            sparsity=0.1
+        )
+
+    _save_with_seed(results_M1, 'M1', create_results_table)
+print("\n" + "="*80)
+print("\u2705 M1 BENCHMARK COMPLETED!")
+print("="*80)
+
+
+# === cell #14 ===
+# =============================================================================
+# 15. VISUALIZE M1 RESULTS
+# =============================================================================
+
+# Generate plots
+data_M1 = plot_vae_svae_benchmark(results_M1, method_name='M1', save_prefix='svae_mixed_benchmark')
+
+# Energy breakdown
+plot_energy_breakdown(results_M1, method_name='M1', save_prefix='svae_mixed_breakdown')
+
+# Results table
+df_M1 = create_results_table(results_M1, method_name='M1')
+print("\n📊 M1 Results Summary:")
+print(df_M1.to_string(index=False))
+
+
+# === cell #15 ===
+# =============================================================================
+# 16. RUN BENCHMARK M2
+# =============================================================================
+
+print("\n" + "="*80)
+print("\U0001f680 STARTING M2 BENCHMARK - MIXED GHZ STATES")
+print("="*80)
+
+# Run M2 benchmark
+if _seed_done('M2'):
+    print(f"[multiseed] seed={SEED} method=M2 already done — skipping", flush=True)
+    results_M2 = None
+else:
+    if _ARGS.quick:
+        results_M2 = run_vae_svae_benchmark(
+            N_list=[3],
+            methods=['M2'],
+            M_M1=256,           # M-sweep validated
+            M_M2=4,             # M-sweep validated
+            steps=3,
+            lr=1e-3,
+            crossbar_bits=[8, 4],
+            use_amp=True,
+            sparsity=0.1
+        )
+
+    else:
+        results_M2 = run_vae_svae_benchmark(
+            N_list=[3, 4, 5, 6, 7, 8],
+            methods=['M2'],
+            M_M1=256,           # M-sweep validated
+            M_M2=4,             # M-sweep validated
+            steps=500,
+            lr=1e-3,
+            crossbar_bits=[8, 4],
+            use_amp=True,
+            sparsity=0.1
+        )
+
+    _save_with_seed(results_M2, 'M2', create_results_table)
+print("\n" + "="*80)
+print("\u2705 M2 BENCHMARK COMPLETED!")
+print("="*80)
+
+
+# === cell #16 ===
+# =============================================================================
+# 17. VISUALIZE M2 RESULTS
+# =============================================================================
+
+# Generate plots
+data_M2 = plot_vae_svae_benchmark(results_M2, method_name='M2', save_prefix='svae_mixed_benchmark')
+
+# Energy breakdown
+plot_energy_breakdown(results_M2, method_name='M2', save_prefix='svae_mixed_breakdown')
+
+# Results table
+df_M2 = create_results_table(results_M2, method_name='M2')
+print("\n📊 M2 Results Summary:")
+print(df_M2.to_string(index=False))
+
+
+# === cell #17 ===
+# =============================================================================
+# 18. SAVE RESULTS
+# =============================================================================
+
+# Save to pickle
+with open('svae_mixed_benchmark_results.pkl', 'wb') as f:
+    pickle.dump({'M1': results_M1, 'M2': results_M2}, f)
+
+# Save tables to CSV
+df_M1.to_csv('svae_mixed_results_M1.csv', index=False)
+df_M2.to_csv('svae_mixed_results_M2.csv', index=False)
+
+print("\n\u2705 Results saved to:")
+print("   - svae_mixed_benchmark_results.pkl")
+print("   - svae_mixed_results_M1.csv")
+print("   - svae_mixed_results_M2.csv")
+print("   - svae_mixed_benchmark_M1.png")
+print("   - svae_mixed_benchmark_M2.png")
+print("   - svae_mixed_breakdown_M1.png")
+print("   - svae_mixed_breakdown_M2.png")
+
+
+# === cell #18 ===
+# =============================================================================
+# 19. FINAL SUMMARY
+# =============================================================================
+
+print("\n" + "="*80)
+print("📊 FINAL BENCHMARK SUMMARY - MIXED GHZ STATES")
+print("="*80)
+
+# Combine M1 and M2 results
+df_combined = pd.concat([df_M1.assign(Method='M1'), df_M2.assign(Method='M2')])
+
+# Summary statistics
+print("\n🎯 Key Findings:")
+print("="*60)
+
+# Best speedups
+for method in ['M1', 'M2']:
+    df_method = df_combined[df_combined['Method'] == method]
+    if len(df_method) > 0:
+        best_loihi = df_method[df_method['Hardware'] == 'Loihi']['Speedup'].max()
+        best_8b = df_method[df_method['Hardware'] == 'Crossbar-8b']['Speedup'].max()
+        best_4b = df_method[df_method['Hardware'] == 'Crossbar-4b']['Speedup'].max()
+
+        print(f"\n{method}:")
+        if not pd.isna(best_loihi):
+            print(f"  SVAE-Loihi max speedup: {best_loihi:.0f}×")
+        if not pd.isna(best_8b):
+            print(f"  SVAE-Crossbar-8b max speedup: {best_8b:.0f}×")
+        if not pd.isna(best_4b):
+            print(f"  SVAE-Crossbar-4b max speedup: {best_4b:.0f}×")
+
+print("\n" + "="*80)
+print("✅ BENCHMARK COMPLETE!")
+print("="*80)
+
